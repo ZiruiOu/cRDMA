@@ -181,7 +181,7 @@ void print_qp_state(struct ibv_qp * qp) {
 }
 
 //const char server_addr[] = "172.16.112.43";
-const char server_name[] = "dl43";
+const char server_name[] = "172.16.112.43";
 const int port = 7788;
 
 void serialize_gid(const union ibv_gid* gid, char *buffer) {
@@ -354,8 +354,6 @@ on_fail:
 }
 
 
-
-
 int main() {
     int num_devices;
     struct ibv_device **device_list;
@@ -435,7 +433,7 @@ int main() {
     // INIT -> RTR (Ready to Receive)
     // RTR -> RTS (Ready to Send)
 
-    int is_server = 1;
+    int is_server = 0;
     rdma_dest_t *rem_dest;
     if (is_server) {
         rem_dest = server_exchange_dest(&my_dest);
