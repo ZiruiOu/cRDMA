@@ -103,7 +103,28 @@ int modify_rtr_state(ibv_qp* qp, rdma_dest_t* dest) {
     return ret;
 }
 
-int rdma_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_dest) {
+void print_qp_state(struct ibv_qp * qp) {
+    struct ibv_qp_attr qp_attr;
+    struct ibv_qp_init_attr init_attr;
+
+    // attr_mask: see https://www.man7.org/linux/man-pages/man3/ibv_modify_qp.3.html for more details.
+    int ret = ibv_query_qp(qp, &qp_attr, IBV_QP_STATE, &init_attr);
+    RDMA_CHECK(ret == 0, "ibv_query_qp() error.");
+
+    // enum ibv_qp_state {
+    //     IBV_QPS_RESET,
+    //     IBV_QPS_INIT,
+    //     IBV_QPS_RTR,
+    //     IBV_QPS_RTS,
+    //     IBV_QPS_SQD,
+    //     IBV_QPS_SQE,
+    //     IBV_QPS_ERR,
+    //     IBV_QPS_UNKNOWN
+    // };
+    printf("qp=%p, qp_state=%d\n", qp, qp_attr.qp_state);
+}
+
+int pp_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_dest) {
     struct ibv_qp_attr attr = {
         .qp_state = IBV_QPS_RTR,
         .path_mtu = IBV_MTU_4096,
@@ -120,6 +141,10 @@ int rdma_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_
         .min_rnr_timer = 12,
     };
 
+    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.dgid = rem_dest->gid;
+    attr.ah_attr.grh.sgid_index = 1;
+
     int rc = ibv_modify_qp(qp, &attr, 
                             IBV_QP_STATE              |
                             IBV_QP_AV                 |
@@ -133,6 +158,8 @@ int rdma_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_
         fprintf(stderr, "rdma_connect: ibv_modify_qp fail to convert INIT->RTR ...");
         return rc;
     }
+
+    print_qp_state(qp);
 
     attr.qp_state = IBV_QPS_RTS;
     attr.timeout = 14;
@@ -157,28 +184,6 @@ int rdma_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_
     return 0;
 }
 
-
-
-void print_qp_state(struct ibv_qp * qp) {
-    struct ibv_qp_attr qp_attr;
-    struct ibv_qp_init_attr init_attr;
-
-    // attr_mask: see https://www.man7.org/linux/man-pages/man3/ibv_modify_qp.3.html for more details.
-    int ret = ibv_query_qp(qp, &qp_attr, IBV_QP_STATE, &init_attr);
-    RDMA_CHECK(ret == 0, "ibv_query_qp() error.");
-
-    // enum ibv_qp_state {
-    //     IBV_QPS_RESET,
-    //     IBV_QPS_INIT,
-    //     IBV_QPS_RTR,
-    //     IBV_QPS_RTS,
-    //     IBV_QPS_SQD,
-    //     IBV_QPS_SQE,
-    //     IBV_QPS_ERR,
-    //     IBV_QPS_UNKNOWN
-    // };
-    printf("qp=%p, qp_state=%d\n", qp, qp_attr.qp_state);
-}
 
 //const char server_addr[] = "172.16.112.43";
 const char server_name[] = "172.16.112.43";
@@ -387,23 +392,23 @@ int main() {
     int ret = ibv_query_port(context, PORT_NUM, &port_attr);
     printf("Device %s has %d active gidx\n", context->device->name, port_attr.gid_tbl_len);
 
-    struct ibv_qp *qp1;
-    qp1 = create_qp(pd, cq);
-    print_qp_state(qp1);
+    struct ibv_qp *qp;
+    qp = create_qp(pd, cq);
+    print_qp_state(qp);
 
     // RESET -> INIT
-    init_qp(qp1);
-    print_qp_state(qp1);
+    init_qp(qp);
+    print_qp_state(qp);
 
     // INIT -> RTR -> RTS
 
     // (lid, qpn, psn, gid)
     rdma_dest_t my_dest;
     my_dest.lid = port_attr.lid;
-    my_dest.qpn = qp1->qp_num;
+    my_dest.qpn = qp->qp_num;
     my_dest.psn = lrand48() & 0xffffffff;
 
-    int rc = ibv_query_gid(context, PORT_NUM, 0, &my_dest.gid);
+    int rc = ibv_query_gid(context, PORT_NUM, 1, &my_dest.gid);
     RDMA_CHECK(rc == 0, "ibv_query_gid() failed");
 
     char gid[33];
@@ -442,9 +447,14 @@ int main() {
     }
 
     if (rem_dest) {
-        printf("Subnet prefix = %llx, id = %llx\n", 
+        printf("remote lid = %hx, qpn = %x, psn = %x\n", 
+                rem_dest->lid, rem_dest->qpn, rem_dest->psn);
+
+        printf("remote Subnet prefix = %llx, id = %llx\n", 
                 rem_dest->gid.global.subnet_prefix, 
                 rem_dest->gid.global.interface_id);
+        pp_connect(qp, rem_dest, &my_dest);
+        print_qp_state(qp);
     }
 
     ibv_destroy_cq(cq);
