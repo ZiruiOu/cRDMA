@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+#include <string>
+
 #define RDMA_CHECK(cond, err_fmt, ...) \
     do { \
      if (!(cond)) { \
@@ -73,15 +75,15 @@ int init_qp(ibv_qp * qp){
 int modify_rtr_state(ibv_qp* qp, rdma_dest_t* dest) {
     struct ibv_qp_attr qp_attr = {
         .qp_state = IBV_QPS_RTR,
-        .path_mtu = IBV_MTU_4096,
+        .path_mtu = IBV_MTU_512,
         .rq_psn = dest->psn,
         .dest_qp_num = dest->qpn,
         .ah_attr = {
             .dlid = dest->lid,
             .sl = 0,
             .src_path_bits = 0,
-            .is_global = 0,
-            .port_num = 1
+            .is_global = 1,
+            .port_num = PORT_NUM
         },
         .max_dest_rd_atomic = 1,
         .min_rnr_timer = 12,
@@ -127,15 +129,15 @@ void print_qp_state(struct ibv_qp * qp) {
 int pp_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_dest) {
     struct ibv_qp_attr attr = {
         .qp_state = IBV_QPS_RTR,
-        .path_mtu = IBV_MTU_4096,
+        .path_mtu = IBV_MTU_512,
         .rq_psn = rem_dest->psn,
         .dest_qp_num = rem_dest->qpn,
         .ah_attr = {
             .dlid = rem_dest->lid,
             .sl = 0,
             .src_path_bits = 0,
-            .is_global = 0,
-            .port_num = 1
+            .is_global = 1,
+            .port_num = PORT_NUM
         },
         .max_dest_rd_atomic = 1,
         .min_rnr_timer = 12,
@@ -143,7 +145,7 @@ int pp_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_de
 
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = rem_dest->gid;
-    attr.ah_attr.grh.sgid_index = 1;
+    attr.ah_attr.grh.sgid_index = 0;
 
     int rc = ibv_modify_qp(qp, &attr, 
                             IBV_QP_STATE              |
@@ -161,6 +163,7 @@ int pp_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_de
 
     print_qp_state(qp);
 
+    memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
     attr.timeout = 14;
     attr.retry_cnt = 7;
@@ -174,7 +177,6 @@ int pp_connect(ibv_qp *qp, const rdma_dest_t *rem_dest, const rdma_dest_t *my_de
                        IBV_QP_RETRY_CNT             | 
                        IBV_QP_RNR_RETRY             |
                        IBV_QP_SQ_PSN                |
-                       IBV_QP_MAX_DEST_RD_ATOMIC    |
                        IBV_QP_MAX_QP_RD_ATOMIC);
     if (rc < 0) {
         fprintf(stderr, "rdma_connect: ibv_modify_qp fail to convert RTR -> RTS");
@@ -223,7 +225,7 @@ server_exchange_dest(const rdma_dest_t* my_dest) {
         if (sockfd >= 1) {
             n = 1;
 
-            // TODO: set SO_REUSEADDR ?
+            setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &n, sizeof n);
             if (!bind(sockfd, t->ai_addr, t->ai_addrlen)) {
                 break;
             }
@@ -328,6 +330,7 @@ client_exchange_dest(const rdma_dest_t* my_dest) {
     memset(msg, 0, sizeof(msg));
     serialize_gid(&my_dest->gid, gid_buf);
     sprintf(msg, "%04x:%06x:%06x:%s", my_dest->lid, my_dest->psn, my_dest->qpn, gid_buf);
+    printf("serialized msg = %s\n", msg);
     n = write(sockfd, msg, sizeof(msg));
     if (n != sizeof(msg)) {
         fprintf(stderr, "client_exchange_dest: cannot send local address.");
@@ -359,7 +362,18 @@ on_fail:
 }
 
 
-int main() {
+int main(int argc, char *argv[]) {
+    int o, is_server = 0;
+
+    while ((o = getopt(argc, argv, "s")) != -1) {
+        switch (o) {
+            case 's':
+                is_server = 1;
+                printf("Set as server");
+                break;
+        }
+    }
+
     int num_devices;
     struct ibv_device **device_list;
     struct ibv_context *context;
@@ -370,8 +384,15 @@ int main() {
     printf("Number of RDMA devices = %d\n", num_devices);
 
     // Open handle for device[0]
-    context = ibv_open_device(device_list[0]);
-    printf("Opening device : %s\n", device_list[0]->name);
+    int i;
+    for (i = 0; device_list[i]; ++i) {
+        if(!strcmp(ibv_get_device_name(device_list[i]), "mlx5_0")) {
+            break;
+        }
+    }
+    struct ibv_device *ib_dev = device_list[i];
+    context = ibv_open_device(ib_dev);
+    printf("Opening device : %s\n", ibv_get_device_name(ib_dev));
 
     pd = ibv_alloc_pd(context);
     if (!pd) {
@@ -408,7 +429,7 @@ int main() {
     my_dest.qpn = qp->qp_num;
     my_dest.psn = lrand48() & 0xffffffff;
 
-    int rc = ibv_query_gid(context, PORT_NUM, 1, &my_dest.gid);
+    int rc = ibv_query_gid(context, PORT_NUM, 0, &my_dest.gid);
     RDMA_CHECK(rc == 0, "ibv_query_gid() failed");
 
     char gid[33];
@@ -438,7 +459,6 @@ int main() {
     // INIT -> RTR (Ready to Receive)
     // RTR -> RTS (Ready to Send)
 
-    int is_server = 0;
     rdma_dest_t *rem_dest;
     if (is_server) {
         rem_dest = server_exchange_dest(&my_dest);
@@ -456,6 +476,96 @@ int main() {
         pp_connect(qp, rem_dest, &my_dest);
         print_qp_state(qp);
     }
+
+    const uint32_t buff_size = 1024 * 1024;
+    char *buffer = (char *)malloc(buff_size);
+    memset(buffer, 0, sizeof(buff_size));
+
+    std::string text = "Hello, greeting from dl43!";
+    if (is_server) {
+        memcpy(buffer, text.c_str(), text.size());
+        struct ibv_mr *send_mr = ibv_reg_mr(pd, buffer, buff_size,
+                                            IBV_ACCESS_LOCAL_WRITE |
+                                            IBV_ACCESS_REMOTE_WRITE |
+                                            IBV_ACCESS_REMOTE_READ);
+        RDMA_CHECK(send_mr, "ibv_reg_mr() failed");
+
+        struct ibv_sge send_sge;
+        struct ibv_send_wr send_wr, *bad_wr;
+        send_sge.addr = (uint64_t)buffer;
+        send_sge.length = buff_size;
+        send_sge.lkey = send_mr->lkey;
+
+        memset(&send_wr, 0, sizeof(send_wr));
+        send_wr.wr_id = 114514;
+        send_wr.sg_list = &send_sge;
+        send_wr.num_sge = 1;
+        send_wr.opcode = IBV_WR_SEND;
+        send_wr.send_flags = IBV_SEND_SIGNALED;
+
+        int rc = ibv_post_send(qp, &send_wr, &bad_wr);
+        RDMA_CHECK(rc == 0, "RDMA ibv_post_send failed");
+
+        // busy polling for success.
+        while (1) {
+            struct ibv_wc wc;
+            int cnt = ibv_poll_cq(cq, 1, &wc);
+            if (cnt == 0) {
+                continue;
+            }
+            if (wc.status != IBV_WC_SUCCESS) {
+                printf("wc.status != IBV_WC_SUCCESS, wc.status = %u, wr_id = %lu\n",
+                        wc.status, wc.wr_id);
+                continue;
+            }
+            if (wc.opcode == IBV_WC_SEND) {
+                printf("Send success!");
+                break;
+            }
+        }
+    } else {
+        struct ibv_mr *recv_mr = ibv_reg_mr(pd, buffer, buff_size,
+                                           IBV_ACCESS_LOCAL_WRITE  |
+                                           IBV_ACCESS_REMOTE_WRITE |
+                                           IBV_ACCESS_REMOTE_READ);
+        RDMA_CHECK(recv_mr, "ibv_reg_mr() failed");
+
+        struct ibv_sge recv_sge;
+        struct ibv_recv_wr recv_wr, *bad_wr;
+        recv_sge.addr = (uint64_t) buffer;
+        recv_sge.length = buff_size;
+        recv_sge.lkey  = recv_mr->lkey;
+
+        memset(&recv_wr, 0, sizeof(recv_wr));
+        recv_wr.wr_id = 1919810;
+        recv_wr.sg_list = &recv_sge;
+        recv_wr.num_sge = 1;
+
+        int rc = ibv_post_recv(qp, &recv_wr, &bad_wr);
+        RDMA_CHECK(rc == 0, "ibv_post_recv failed.");
+
+        // busy polling for corresponding work completion.
+        while (1) {
+            struct ibv_wc wc;
+            int cnt = ibv_poll_cq(cq, 1, &wc);
+            if (cnt == 0) {
+                continue;
+            }
+            if (wc.status != IBV_WC_SUCCESS) {
+                printf("wc.status != IBV_WC_SUCCESS, wc.status = %u, wr_id = %lu\n",
+                        wc.status, wc.wr_id);
+                continue;
+            }
+            if (wc.opcode == IBV_WC_RECV) {
+                std::string msg(buffer, buff_size);
+                printf("Receive success with message = %s\n", msg.c_str());
+                break;
+            }
+        }
+
+    }
+
+
 
     ibv_destroy_cq(cq);
     ibv_destroy_comp_channel(channel);
