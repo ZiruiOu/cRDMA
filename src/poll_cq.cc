@@ -413,6 +413,7 @@ int main(int argc, char *argv[]) {
     int ret = ibv_query_port(context, PORT_NUM, &port_attr);
     printf("Device %s has %d active gidx\n", context->device->name, port_attr.gid_tbl_len);
 
+
     struct ibv_qp *qp;
     qp = create_qp(pd, cq);
     print_qp_state(qp);
@@ -429,7 +430,8 @@ int main(int argc, char *argv[]) {
     my_dest.qpn = qp->qp_num;
     my_dest.psn = lrand48() & 0xffffffff;
 
-    int rc = ibv_query_gid(context, PORT_NUM, 0, &my_dest.gid);
+    // GID[0] contains the port GID, See https://www.rdmamojo.com/2012/08/02/ibv_query_gid/
+    int rc = ibv_query_gid(context, PORT_NUM, 0, &my_dest.gid); 
     RDMA_CHECK(rc == 0, "ibv_query_gid() failed");
 
     char gid[33];
