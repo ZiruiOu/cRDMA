@@ -1,4 +1,12 @@
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <infiniband/verbs.h>
@@ -30,6 +38,19 @@ struct RDMAEndpoint {
     uint32_t psn;
     union ibv_gid gid;
 };
+
+
+// Simple message to exchange
+// lid, qpn, psn, gid, raddr & rkey
+struct RDMAMsg{
+    uint64_t addr;      // buffer address
+    uint32_t rkey;      // remote key
+    uint32_t qpn;       // queue pair number
+    uint32_t psn;       // packet sequence number
+    uint16_t lid;       // LID of the IB port
+    uint8_t  gid[16];   // gid
+} __attribute__((packed));
+
 
 struct RDMAContext* createRDMAContext(const char *deviceName, uint8_t portNum) {
     int numDevice;
@@ -122,7 +143,9 @@ int modifyQPToInit(struct ibv_qp * qp, struct RDMAContext *ctx) {
 
 
 int modifyQPToRTR(struct ibv_qp * qp, 
-                struct RDMAEndpoint *rAddr, 
+                //struct RDMAEndpoint *rAddr, 
+                uint32_t rPSN, uint32_t rQPN,
+                uint16_t rLID, union ibv_gid gid,
                 struct RDMAContext *ctx) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -133,10 +156,13 @@ int modifyQPToRTR(struct ibv_qp * qp,
     attr = {
         .qp_state = IBV_QPS_RTR,
         .path_mtu = IBV_MTU_512,
-        .rq_psn = rAddr->psn,
-        .dest_qp_num = rAddr->qpn,
+        //.rq_psn = rAddr->psn,
+        //.dest_qp_num = rAddr->qpn,
+        .rq_psn = rPSN,
+        .dest_qp_num = rQPN,
         .ah_attr = {
-            .dlid = rAddr->lid,
+            //.dlid = rAddr->lid,
+            .dlid = rLID,
             .sl = 0,
             .src_path_bits = 0,
             .is_global = 1,
@@ -146,9 +172,14 @@ int modifyQPToRTR(struct ibv_qp * qp,
         .min_rnr_timer = 12,
     };
 
+    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.dgid = gid;
+    attr.ah_attr.grh.sgid_index = 0;
+
     int ret = ibv_modify_qp(
         qp, &attr, 
         IBV_QP_STATE |
+        IBV_QP_AV    |
         IBV_QP_PATH_MTU |
         IBV_QP_RQ_PSN   |
         IBV_QP_DEST_QPN |
@@ -157,10 +188,17 @@ int modifyQPToRTR(struct ibv_qp * qp,
         IBV_QP_MIN_RNR_TIMER
     );
 
+    if (ret < 0) {
+        fprintf(stderr, "rdma_connect: ibv_modify_qp fail to convert INIT->RTR ...");
+    }
+
     return ret;
 }
 
-int modifyQPToRTS(struct ibv_qp *qp, struct RDMAEndpoint *lAddr) {
+int modifyQPToRTS(struct ibv_qp *qp, 
+                  //struct RDMAEndpoint *lAddr
+                  uint32_t lPSN
+                  ) {
     struct ibv_qp_attr attr;
 
     memset(&attr, 0, sizeof(attr));
@@ -168,7 +206,8 @@ int modifyQPToRTS(struct ibv_qp *qp, struct RDMAEndpoint *lAddr) {
     attr.timeout = 14;
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
-    attr.sq_psn = lAddr->psn;
+    //attr.sq_psn = lAddr->psn;
+    attr.sq_psn = lPSN;
     attr.max_rd_atomic = 1;
 
     int ret = ibv_modify_qp(
@@ -258,6 +297,29 @@ int RDMAReceive(ibv_qp *qp, uintptr_t bufAddr, uint32_t length, uint32_t lKey) {
     return ret;
 }
 
+int RDMAWrite(ibv_qp *qp, uintptr_t buffAddr, uint32_t length, uint32_t lKey, 
+              uint64_t remoteAddr, uint32_t rKey, int imm) {
+
+    struct ibv_sge sge;
+    struct ibv_send_wr sr;
+
+    sge.addr = (uint64_t) buffAddr;
+    sge.length = length;
+    sge.lkey = lKey;
+
+    memset(&sr, 0, sizeof(sr));
+    sr.wr_id = 0;
+    sr.next  = nullptr;
+    sr.sg_list = &sge;
+    sr.num_sge = 1;
+    if (imm > -1) {
+        sr.imm_data = imm;
+    }
+
+    sr.wr.rdma.remote_addr = remoteAddr;
+    sr.wr.rdma.rkey = rKey;
+}
+
 int PollWithCQ(ibv_cq *cq, int numSucc, ibv_wc *wc) {
     int cnt = 0;
     do {
@@ -272,19 +334,197 @@ int PollWithCQ(ibv_cq *cq, int numSucc, ibv_wc *wc) {
     return cnt;
 }
 
+const char server_name[] = "172.16.112.43";
+const int port = 7788;
 
-int main() {
+int GetAvailableSocket(int isServer) {
+    struct addrinfo *res;
+    struct addrinfo hints = {
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+    };
+    if (isServer) {
+        hints.ai_flags = AI_PASSIVE;
+    }
+
+    int sockfd;
+    char service[5];
+    memset(service, 0, sizeof(service));
+    sprintf(service, "%d", port);
+
+    int n = getaddrinfo(server_name, service, &hints, &res);
+    for(struct addrinfo *t = res; t; t = t->ai_next) {
+        sockfd = socket(t->ai_family, t->ai_socktype, t->ai_protocol);
+        if (sockfd >= 1) {
+            n = 1;
+            if (isServer) {
+                setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &n, sizeof n);
+                if (!bind(sockfd, t->ai_addr, t->ai_addrlen)) {
+                    break;
+                }
+            } else {
+                if (!connect(sockfd, t->ai_addr, t->ai_addrlen)) {
+                    break;
+                }
+            }
+            close(sockfd);
+            sockfd = -1;
+        }
+    }
+    freeaddrinfo(res);
+    return sockfd;
+}
+
+
+// socket connection setup.
+int ServerConnect() {
+    int sockfd, connfd;
+    sockfd = GetAvailableSocket(1);
+
+    listen(sockfd, 1);
+    connfd = accept(sockfd, NULL, NULL);
+    close(sockfd);
+
+    return connfd;
+}
+
+int ClientConnect() {
+    return GetAvailableSocket(0);
+}
+
+int SocketRead(int sock, char *buffer, int length) {
+    int ret = 0;
+    int totalReadBytes = 0;
+
+    while(!ret && totalReadBytes < length) {
+        ret = read(sock, buffer + totalReadBytes, length - totalReadBytes);
+        if (ret == -1) {
+            // socket read error.
+            return -1;
+        }
+        if (ret == 0) {
+            // End of file or connection failed.
+            break;
+        }
+        totalReadBytes += ret;
+    }
+    return totalReadBytes;
+}
+
+
+int main(int argc, char* argv[]) {
     char deviceName[7] = "mlx5_0";
     uint8_t portNum = 1;
 
+    int o, isServer;
+
+    isServer = 0;
+    while ((o = getopt(argc, argv, "s")) != -1) {
+        switch (o) {
+            case 's':
+                isServer = 1;
+                printf("Set as server\n");
+                break;
+        }
+    }
+
     RDMAContext *context = createRDMAContext(deviceName, portNum);
 
+    // create queue pair.
     struct ibv_qp *qp = createQP(context);
     modifyQPToInit(qp, context);
     queryQPState(qp);
 
-    // negotiate RDMAEndpoint.
+    // create memory region.
+    int length = 32 * 1024 * 1024;
+    char *buffer = (char *)malloc(length);
 
+    struct ibv_mr *mr = ibv_reg_mr(context->pd, buffer, length, 
+                                    IBV_ACCESS_LOCAL_WRITE 
+                                    | IBV_ACCESS_REMOTE_READ 
+                                    | IBV_ACCESS_REMOTE_WRITE);
+    // lkey: For local HCA access admission check.
+    // rkey: For remote HCA access admission check.
+
+
+    // negotiate RDMAEndpoint.
+    // TODO: refactor/remove.
+    struct ibv_port_attr attr;
+    int rc = ibv_query_port(context->ctx, context->portNum, &attr);
+
+
+    struct RDMAMsg lMeta, rMeta, temp;
+
+    // serialize local buffer address, rkey, and connections.
+    lMeta.addr = ((uint64_t)buffer);
+    lMeta.rkey =(mr->rkey);
+    lMeta.lid = (attr.lid);
+    lMeta.qpn = (qp->qp_num);
+    lMeta.psn = (lrand48() & 0xffffffff);
+    rc = ibv_query_gid(context->ctx, 
+                       context->portNum, 
+                       context->deviceIdx, 
+                       (ibv_gid*) &lMeta.gid);
+
+    temp.addr = htobe64((uint64_t)buffer);
+    temp.rkey = htobe32(mr->rkey);
+    temp.lid = htobe16(attr.lid);
+    temp.qpn = htobe32(qp->qp_num);
+    temp.psn = htobe32(lrand48() & 0xffffffff);
+    memcpy(&temp.gid, &lMeta.gid, sizeof(temp.gid));
+    
+    // exchange through socket.
+    int fd;
+    if (isServer) {
+        fd = ServerConnect();
+        int n = write(fd, &temp, sizeof(temp));
+        if (n != sizeof(temp)) {
+            printf("Server: fail to send metadata");
+        }
+        n = SocketRead(fd, (char*)&rMeta, sizeof(rMeta));
+        if (n != sizeof(rMeta)) {
+            printf("Server: fail to receive metadata");
+        }
+        printf("Server: ok to exchange metadata\n");
+
+    } else {
+        fd = ClientConnect();
+        int n = SocketRead(fd, (char*)&rMeta, sizeof(rMeta));
+        if (n != sizeof(rMeta)) {
+            printf("Client: fail to receive metadata");
+        }
+        n = write(fd, &temp, sizeof(temp));
+        if (n != sizeof(temp)) {
+            printf("Client: fail to receive metadata");
+        }
+        printf("Client: ok to exchange metadata\n");
+    }
+    
+    rMeta.addr = be64toh(rMeta.addr);
+    rMeta.rkey = be32toh(rMeta.rkey);
+    rMeta.lid =  be16toh(rMeta.lid);
+    rMeta.qpn =  be32toh(rMeta.qpn);
+    rMeta.psn =  be32toh(rMeta.psn);
+
+    printf("Local addr: %lx, rkey: %x, lid: %x, qpn: %x\n", 
+            lMeta.addr, lMeta.rkey, lMeta.lid, lMeta.qpn);
+    printf("Remote addr: %lx, rkey: %x, lid: %x, qpn: %x\n", 
+            rMeta.addr, rMeta.rkey, rMeta.lid, rMeta.qpn);
+
+
+    union ibv_gid rgid;
+    memcpy(&rgid, rMeta.gid, sizeof(rgid));
+
+    //printf("Remote gid: ");
+    //for (int i = 0; i < 8; i++) {
+    //    printf("%x%x:", rgid.raw[2*i], rgid.raw[2*i+1]);
+    //}
+    //printf("\n");
+
+    modifyQPToRTR(qp, rMeta.psn, rMeta.qpn, rMeta.lid, rgid, context);
+    modifyQPToRTS(qp, lMeta.psn);
+
+    queryQPState(qp);
 
     return 0;
 }
