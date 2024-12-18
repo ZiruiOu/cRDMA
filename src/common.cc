@@ -1,6 +1,9 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
+#include <malloc.h>
+
 
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -80,12 +83,7 @@ struct RDMAContext* createRDMAContext(const char *deviceName, uint8_t portNum) {
     return context;
 }
 
-// RDMA create queue pair (QP)
-struct ibv_qp * createQP(struct RDMAContext *context) {
-    // create qp
-    struct ibv_qp_init_attr attr;
-    memset(&attr, 0, sizeof(attr));
-
+struct ibv_cq *createCQ(struct RDMAContext *context) {
     // create completion channel
     // FIXME: check that compChan != NULL
     struct ibv_comp_channel *compChan = ibv_create_comp_channel(context->ctx);
@@ -94,6 +92,15 @@ struct ibv_qp * createQP(struct RDMAContext *context) {
     struct ibv_cq *cq = ibv_create_cq(
         context->ctx, 128, nullptr, compChan, 0
     );
+
+    return cq;
+}
+
+// RDMA create queue pair (QP)
+struct ibv_qp * createQP(struct RDMAContext *context, struct ibv_cq *cq) {
+    // create qp
+    struct ibv_qp_init_attr attr;
+    memset(&attr, 0, sizeof(attr));
 
     // Queue pair configurations.
     attr.send_cq = cq;
@@ -297,11 +304,37 @@ int RDMAReceive(ibv_qp *qp, uintptr_t bufAddr, uint32_t length, uint32_t lKey) {
     return ret;
 }
 
+int RDMARead(ibv_qp *qp, uintptr_t buffAddr, uint32_t length, uint32_t lKey,
+             uint64_t remoteAddr, uint32_t rKey) {
+    struct ibv_sge sge;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *badWr;
+
+    sge.addr = buffAddr;
+    sge.length = length;
+    sge.lkey = lKey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = 0;
+    wr.num_sge = 1;
+    wr.sg_list = &sge;
+
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.wr_id = 0; // TODO
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remoteAddr;
+    wr.wr.rdma.rkey = rKey;
+
+    int rc = ibv_post_send(qp, &wr, &badWr);
+    return rc;
+}
+
 int RDMAWrite(ibv_qp *qp, uintptr_t buffAddr, uint32_t length, uint32_t lKey, 
               uint64_t remoteAddr, uint32_t rKey, int imm) {
 
     struct ibv_sge sge;
     struct ibv_send_wr sr;
+    struct ibv_send_wr *badWr;
 
     sge.addr = (uint64_t) buffAddr;
     sge.length = length;
@@ -312,12 +345,22 @@ int RDMAWrite(ibv_qp *qp, uintptr_t buffAddr, uint32_t length, uint32_t lKey,
     sr.next  = nullptr;
     sr.sg_list = &sge;
     sr.num_sge = 1;
+    sr.send_flags = IBV_SEND_SIGNALED;
     if (imm > -1) {
+        sr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM; 
         sr.imm_data = imm;
+    } else {
+        sr.opcode = IBV_WR_RDMA_WRITE;
     }
 
     sr.wr.rdma.remote_addr = remoteAddr;
     sr.wr.rdma.rkey = rKey;
+
+    int rc = ibv_post_send(qp, &sr, &badWr);
+    if (rc) {
+        printf("RDMAWrite error!\n");
+    }
+    return rc;
 }
 
 int PollWithCQ(ibv_cq *cq, int numSucc, ibv_wc *wc) {
@@ -431,13 +474,20 @@ int main(int argc, char* argv[]) {
     RDMAContext *context = createRDMAContext(deviceName, portNum);
 
     // create queue pair.
-    struct ibv_qp *qp = createQP(context);
+    struct ibv_cq *cq = createCQ(context);
+    struct ibv_qp *qp = createQP(context, cq);
     modifyQPToInit(qp, context);
     queryQPState(qp);
 
     // create memory region.
-    int length = 32 * 1024 * 1024;
-    char *buffer = (char *)malloc(length);
+    int length = 32 * 1024;
+    //char *buffer = (char *)malloc(length);
+    char *buffer = (char*)memalign(1024, length);
+
+    if (isServer) {
+        char wow[] = "Hello, My name is Shinonome Ena.";
+        memcpy(buffer, wow, sizeof(wow));
+    }
 
     struct ibv_mr *mr = ibv_reg_mr(context->pd, buffer, length, 
                                     IBV_ACCESS_LOCAL_WRITE 
@@ -445,7 +495,7 @@ int main(int argc, char* argv[]) {
                                     | IBV_ACCESS_REMOTE_WRITE);
     // lkey: For local HCA access admission check.
     // rkey: For remote HCA access admission check.
-
+    printf("Local address: %p, mr address: %p", buffer, mr->addr);
 
     // negotiate RDMAEndpoint.
     // TODO: refactor/remove.
@@ -456,7 +506,7 @@ int main(int argc, char* argv[]) {
     struct RDMAMsg lMeta, rMeta, temp;
 
     // serialize local buffer address, rkey, and connections.
-    lMeta.addr = ((uint64_t)buffer);
+    lMeta.addr = ((uint64_t)mr->addr);
     lMeta.rkey =(mr->rkey);
     lMeta.lid = (attr.lid);
     lMeta.qpn = (qp->qp_num);
@@ -470,8 +520,10 @@ int main(int argc, char* argv[]) {
     temp.rkey = htobe32(mr->rkey);
     temp.lid = htobe16(attr.lid);
     temp.qpn = htobe32(qp->qp_num);
-    temp.psn = htobe32(lrand48() & 0xffffffff);
+    temp.psn = htobe32(lMeta.psn);
     memcpy(&temp.gid, &lMeta.gid, sizeof(temp.gid));
+
+    printf("My remote key : %x\n", mr->rkey);
     
     // exchange through socket.
     int fd;
@@ -523,8 +575,64 @@ int main(int argc, char* argv[]) {
 
     modifyQPToRTR(qp, rMeta.psn, rMeta.qpn, rMeta.lid, rgid, context);
     modifyQPToRTS(qp, lMeta.psn);
-
     queryQPState(qp);
+
+    // post some empty receives ahead of time.
+    //if (isServer) {
+    //    struct ibv_sge sge;
+    //    struct ibv_recv_wr wr;
+    //    struct ibv_recv_wr *badWr;
+
+    //    memset(&sge, 0, sizeof(sge));
+
+    //    memset(&wr, 0, sizeof(wr));
+    //    wr.wr_id = 0;
+    //    wr.sg_list = &sge;
+    //    wr.num_sge = 1;
+    //    int n = ibv_post_recv(qp, &wr, &badWr);
+    //    if (n) {
+    //        printf("Fail to post receive request");
+    //    }
+    //}
+
+    sleep(4);
+
+
+    if (isServer) {
+        // Empty receive.
+
+        //struct ibv_wc wc;
+        //int n = PollWithCQ(cq, 1, &wc);
+        //if (wc.status != IBV_WC_SUCCESS) {
+        //    printf("Server: poll completion queue fails\n");
+        //}
+
+        while (1);
+
+    } else {
+        //char msg[] = "Hello, This is message from Ena Shinonome.";
+        //memcpy(buffer, msg, sizeof(msg));
+
+        RDMARead(qp, (uintptr_t) buffer, length, 
+            mr->lkey, rMeta.addr, rMeta.rkey);
+
+        // poll cq.
+        struct ibv_wc wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.wr_id = 0;
+        int n = PollWithCQ(cq, 1, &wc);
+        if (wc.status != IBV_WC_SUCCESS) {
+            printf("Client: poll completion queue fails. status code = %d\n",wc.status);
+            printf("Status code = %d\n", wc.status);
+            if (wc.status == IBV_WC_LOC_ACCESS_ERR)
+                printf("Client: Location access error.\n");
+            if (wc.status == IBV_WC_RETRY_EXC_ERR) {
+                printf("Client: Retry execution error.\n");
+            }
+        }
+
+        printf("Received message : %s\n", buffer);
+    }
 
     return 0;
 }
