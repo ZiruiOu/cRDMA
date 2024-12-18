@@ -42,12 +42,29 @@ struct RDMAEndpoint {
     union ibv_gid gid;
 };
 
+struct RDMARegion {
+    uint64_t lAddr;
+    uint64_t rAddr;
+    uint32_t lKey;
+    uint32_t rKey;
+};
+
+const int kRemoteBuffer = 1;
 
 // Simple message to exchange
 // lid, qpn, psn, gid, raddr & rkey
 struct RDMAMsg{
     uint64_t addr;      // buffer address
     uint32_t rkey;      // remote key
+    uint32_t qpn;       // queue pair number
+    uint32_t psn;       // packet sequence number
+    uint16_t lid;       // LID of the IB port
+    uint8_t  gid[16];   // gid
+} __attribute__((packed));
+
+struct RDMAMeta{
+    uint64_t addr[kRemoteBuffer];      // buffer address
+    uint32_t rkey[kRemoteBuffer];      // remote key
     uint32_t qpn;       // queue pair number
     uint32_t psn;       // packet sequence number
     uint16_t lid;       // LID of the IB port
@@ -315,7 +332,6 @@ int RDMARead(ibv_qp *qp, uintptr_t buffAddr, uint32_t length, uint32_t lKey,
     sge.lkey = lKey;
 
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = 0;
     wr.num_sge = 1;
     wr.sg_list = &sge;
 
@@ -360,6 +376,43 @@ int RDMAWrite(ibv_qp *qp, uintptr_t buffAddr, uint32_t length, uint32_t lKey,
     if (rc) {
         printf("RDMAWrite error!\n");
     }
+    return rc;
+}
+
+int RDMAWriteBatch(ibv_qp *qp, char *buffers[kRemoteBuffer], int length, uint32_t lKeys[kRemoteBuffer],
+                   uint64_t rAddrs[kRemoteBuffer], uint32_t rKeys[kRemoteBuffer], int imm) {
+    struct ibv_sge sgeList[kRemoteBuffer];
+    struct ibv_send_wr wrs[kRemoteBuffer];
+    struct ibv_send_wr *badWr;
+
+    for (int i = 0; i < kRemoteBuffer; i++) {
+        sgeList[i].addr = (uint64_t) buffers[i];
+        sgeList[i].length = length;
+        sgeList[i].lkey = lKeys[i];
+
+        memset(&wrs[i], 0, sizeof(wrs[i]));
+        wrs[i].sg_list = &sgeList[i];
+        wrs[i].num_sge = 1;
+
+        // NOTE: doorbell batching .
+        wrs[i].wr_id = 0;
+        wrs[i].next = (i == kRemoteBuffer - 1) ? NULL : &wrs[i+1];
+        wrs[i].opcode = IBV_WR_RDMA_WRITE;
+
+        wrs[i].wr.rdma.remote_addr = rAddrs[i];
+        wrs[i].wr.rdma.rkey = rKeys[i];
+
+        if (i == kRemoteBuffer - 1) {
+            // NOTE: only the last write would generate CQE.
+            wrs[i].send_flags = IBV_SEND_SIGNALED;
+            if (imm > -1) {
+                wrs[i].opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+                wrs[i].imm_data = imm;
+            }
+        }
+    }
+
+    int rc = ibv_post_send(qp, &wrs[0], &badWr);
     return rc;
 }
 
@@ -480,50 +533,65 @@ int main(int argc, char* argv[]) {
     queryQPState(qp);
 
     // create memory region.
-    int length = 32 * 1024;
-    //char *buffer = (char *)malloc(length);
-    char *buffer = (char*)memalign(1024, length);
+    //int length = 32 * 1024;
+    ////char *buffer = (char *)malloc(length);
+    //char *buffer = (char*)memalign(1024, length);
 
-    if (isServer) {
-        char wow[] = "Hello, My name is Shinonome Ena.";
-        memcpy(buffer, wow, sizeof(wow));
+    //if (!isServer) {
+    //    char wow[] = "Hello, My name is Shinonome Ena. Kon no sekai wa bye bye bye bye ...";
+    //    memcpy(buffer, wow, sizeof(wow));
+    //}
+
+    int length = 32 * 1024;
+    struct ibv_mr *mr[kRemoteBuffer];
+    for (int i = 0; i < kRemoteBuffer; i++) {
+        char *buffer = (char*)memalign(1024, length);
+        mr[i] = ibv_reg_mr(
+            context->pd, buffer, length,
+            IBV_ACCESS_LOCAL_WRITE
+            | IBV_ACCESS_REMOTE_WRITE
+            | IBV_ACCESS_REMOTE_READ
+        );
     }
 
-    struct ibv_mr *mr = ibv_reg_mr(context->pd, buffer, length, 
-                                    IBV_ACCESS_LOCAL_WRITE 
-                                    | IBV_ACCESS_REMOTE_READ 
-                                    | IBV_ACCESS_REMOTE_WRITE);
+    //struct ibv_mr *mr = ibv_reg_mr(context->pd, buffer, length, 
+    //                                IBV_ACCESS_LOCAL_WRITE 
+    //                                | IBV_ACCESS_REMOTE_READ 
+    //                                | IBV_ACCESS_REMOTE_WRITE);
     // lkey: For local HCA access admission check.
     // rkey: For remote HCA access admission check.
-    printf("Local address: %p, mr address: %p", buffer, mr->addr);
+    //printf("Local address: %p, mr address: %p", buffer, mr->addr);
 
     // negotiate RDMAEndpoint.
     // TODO: refactor/remove.
     struct ibv_port_attr attr;
     int rc = ibv_query_port(context->ctx, context->portNum, &attr);
 
+    //struct RDMAMsg local, remote, temp;
 
-    struct RDMAMsg lMeta, rMeta, temp;
+    struct RDMAMeta local, remote, temp;
 
     // serialize local buffer address, rkey, and connections.
-    lMeta.addr = ((uint64_t)mr->addr);
-    lMeta.rkey =(mr->rkey);
-    lMeta.lid = (attr.lid);
-    lMeta.qpn = (qp->qp_num);
-    lMeta.psn = (lrand48() & 0xffffffff);
-    rc = ibv_query_gid(context->ctx, 
-                       context->portNum, 
-                       context->deviceIdx, 
-                       (ibv_gid*) &lMeta.gid);
+    for (int i = 0; i < kRemoteBuffer; i++) {
+        local.addr[i] = (uint64_t)mr[i]->addr;
+        local.rkey[i] = mr[i]->rkey;
 
-    temp.addr = htobe64((uint64_t)buffer);
-    temp.rkey = htobe32(mr->rkey);
-    temp.lid = htobe16(attr.lid);
-    temp.qpn = htobe32(qp->qp_num);
-    temp.psn = htobe32(lMeta.psn);
-    memcpy(&temp.gid, &lMeta.gid, sizeof(temp.gid));
+        // fill up temp.
+        temp.addr[i] = htobe64((uint64_t)mr[i]->addr);
+        temp.rkey[i] = htobe32(mr[i]->rkey);
+        printf("Local addr #%d: %lx, rkey: %x\n", i, local.addr[i], local.rkey[i]);
+    }
+    local.lid = attr.lid;
+    local.qpn = qp->qp_num;
+    local.psn = (lrand48() & 0xffffffff);
+    rc = ibv_query_gid(context->ctx, context->portNum, context->deviceIdx,
+                       (ibv_gid*)&local.gid);
 
-    printf("My remote key : %x\n", mr->rkey);
+    temp.lid = htobe16(local.lid);
+    temp.qpn = htobe32(local.qpn);
+    temp.psn = htobe32(local.psn);
+    memcpy((void*)&temp.gid, (void*)local.gid, sizeof(temp.gid));
+
     
     // exchange through socket.
     int fd;
@@ -533,16 +601,16 @@ int main(int argc, char* argv[]) {
         if (n != sizeof(temp)) {
             printf("Server: fail to send metadata");
         }
-        n = SocketRead(fd, (char*)&rMeta, sizeof(rMeta));
-        if (n != sizeof(rMeta)) {
+        n = SocketRead(fd, (char*)&remote, sizeof(remote));
+        if (n != sizeof(remote)) {
             printf("Server: fail to receive metadata");
         }
         printf("Server: ok to exchange metadata\n");
 
     } else {
         fd = ClientConnect();
-        int n = SocketRead(fd, (char*)&rMeta, sizeof(rMeta));
-        if (n != sizeof(rMeta)) {
+        int n = SocketRead(fd, (char*)&remote, sizeof(remote));
+        if (n != sizeof(remote)) {
             printf("Client: fail to receive metadata");
         }
         n = write(fd, &temp, sizeof(temp));
@@ -551,70 +619,90 @@ int main(int argc, char* argv[]) {
         }
         printf("Client: ok to exchange metadata\n");
     }
-    
-    rMeta.addr = be64toh(rMeta.addr);
-    rMeta.rkey = be32toh(rMeta.rkey);
-    rMeta.lid =  be16toh(rMeta.lid);
-    rMeta.qpn =  be32toh(rMeta.qpn);
-    rMeta.psn =  be32toh(rMeta.psn);
 
-    printf("Local addr: %lx, rkey: %x, lid: %x, qpn: %x\n", 
-            lMeta.addr, lMeta.rkey, lMeta.lid, lMeta.qpn);
-    printf("Remote addr: %lx, rkey: %x, lid: %x, qpn: %x\n", 
-            rMeta.addr, rMeta.rkey, rMeta.lid, rMeta.qpn);
+    // deserialize
+    for (int i = 0; i < kRemoteBuffer; i++) {
+        remote.addr[i] = be64toh(remote.addr[i]);
+        remote.rkey[i] = be32toh(remote.rkey[i]);
+        printf("Remote addr #%d: %lx, rkey: %x\n", i, remote.addr[i], remote.rkey[i]);
+    }
+    remote.lid =  be16toh(remote.lid);
+    remote.qpn =  be32toh(remote.qpn);
+    remote.psn =  be32toh(remote.psn);
 
+    printf("Local lid: %x, qpn: %x, psn: %x\n", 
+            local.lid, local.qpn, local.psn);
+    printf("Remote lid: %x, qpn: %x, psn: %x\n", 
+            remote.lid, remote.qpn, remote.psn);
 
     union ibv_gid rgid;
-    memcpy(&rgid, rMeta.gid, sizeof(rgid));
+    memcpy(&rgid, remote.gid, sizeof(rgid));
 
-    //printf("Remote gid: ");
-    //for (int i = 0; i < 8; i++) {
-    //    printf("%x%x:", rgid.raw[2*i], rgid.raw[2*i+1]);
-    //}
-    //printf("\n");
+    printf("Remote gid: ");
+    for (int i = 0; i < 8; i++) {
+        printf("%x%x:", rgid.raw[2*i], rgid.raw[2*i+1]);
+    }
+    printf("\n");
 
-    modifyQPToRTR(qp, rMeta.psn, rMeta.qpn, rMeta.lid, rgid, context);
-    modifyQPToRTS(qp, lMeta.psn);
+    modifyQPToRTR(qp, remote.psn, remote.qpn, remote.lid, rgid, context);
+    modifyQPToRTS(qp, local.psn);
     queryQPState(qp);
 
     // post some empty receives ahead of time.
-    //if (isServer) {
-    //    struct ibv_sge sge;
-    //    struct ibv_recv_wr wr;
-    //    struct ibv_recv_wr *badWr;
+    if (isServer) {
+        struct ibv_sge sge;
+        struct ibv_recv_wr wr;
+        struct ibv_recv_wr *badWr;
 
-    //    memset(&sge, 0, sizeof(sge));
+        memset(&sge, 0, sizeof(sge));
 
-    //    memset(&wr, 0, sizeof(wr));
-    //    wr.wr_id = 0;
-    //    wr.sg_list = &sge;
-    //    wr.num_sge = 1;
-    //    int n = ibv_post_recv(qp, &wr, &badWr);
-    //    if (n) {
-    //        printf("Fail to post receive request");
-    //    }
-    //}
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = 0;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        int rc = ibv_post_recv(qp, &wr, &badWr);
+        if (rc) {
+            printf("Fail to post receive request");
+        }
+    }
 
-    sleep(4);
-
+    usleep(4);
 
     if (isServer) {
         // Empty receive.
 
-        //struct ibv_wc wc;
-        //int n = PollWithCQ(cq, 1, &wc);
-        //if (wc.status != IBV_WC_SUCCESS) {
-        //    printf("Server: poll completion queue fails\n");
-        //}
+        struct ibv_wc wc;
+        int n = PollWithCQ(cq, 1, &wc);
+        if (wc.status != IBV_WC_SUCCESS) {
+            printf("Server: poll completion queue fails\n");
+        }
+        //printf("Received immediate: %d\n", wc.imm_data);
 
-        while (1);
+        for (int i = 0; i < kRemoteBuffer; i++) {
+            printf("Receive #%d buffer: %s", i, (char*) mr[i]->addr);
+        }
 
     } else {
-        //char msg[] = "Hello, This is message from Ena Shinonome.";
-        //memcpy(buffer, msg, sizeof(msg));
 
-        RDMARead(qp, (uintptr_t) buffer, length, 
-            mr->lkey, rMeta.addr, rMeta.rkey);
+        // Generate content.
+        char * buffers[kRemoteBuffer];
+        uint32_t lKeys[kRemoteBuffer];
+        for (int i = 0; i < kRemoteBuffer; i ++) {
+            buffers[i] = (char*) mr[i]->addr;
+            lKeys[i] = mr[i]->lkey;
+            sprintf(buffers[i], 
+                    "#%d: Hello, This is Shinonome Ena. Kono Sekai wa bye bye bye bye ...\n", 
+                    i + 1);
+        }
+
+        //RDMAWriteBatch(
+        //    qp, buffers, length, lKeys, 
+        //    remote.addr, remote.rkey, -1
+        //);
+        RDMAWrite(
+            qp, (uintptr_t) buffers[0], length, lKeys[0],
+            remote.addr[0], remote.rkey[0], 114514
+        );
 
         // poll cq.
         struct ibv_wc wc;
@@ -630,8 +718,7 @@ int main(int argc, char* argv[]) {
                 printf("Client: Retry execution error.\n");
             }
         }
-
-        printf("Received message : %s\n", buffer);
+        //printf("Received message : %s\n", buffer);
     }
 
     return 0;
