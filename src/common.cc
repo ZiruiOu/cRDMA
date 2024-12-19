@@ -49,7 +49,7 @@ struct RDMARegion {
     uint32_t rKey;
 };
 
-const int kRemoteBuffer = 1;
+const int kRemoteBuffer = 4;
 
 // Simple message to exchange
 // lid, qpn, psn, gid, raddr & rkey
@@ -198,7 +198,8 @@ int modifyQPToRTR(struct ibv_qp * qp,
 
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = gid;
-    attr.ah_attr.grh.sgid_index = 0;
+    // FIXME: configure it to be the same as "ibv_query_gid".
+    attr.ah_attr.grh.sgid_index = 3; 
 
     int ret = ibv_modify_qp(
         qp, &attr, 
@@ -509,17 +510,23 @@ int SocketRead(int sock, char *buffer, int length) {
 
 
 int main(int argc, char* argv[]) {
-    char deviceName[7] = "mlx5_0";
+    //char deviceName[7] = "mlx5_0";
+    char *deviceName;
     uint8_t portNum = 1;
 
     int o, isServer;
 
     isServer = 0;
-    while ((o = getopt(argc, argv, "s")) != -1) {
+    const char *optString = "si:";
+
+    while ((o = getopt(argc, argv, optString)) != -1) {
         switch (o) {
             case 's':
                 isServer = 1;
                 printf("Set as server\n");
+                break;
+            case 'i':
+                deviceName = optarg;
                 break;
         }
     }
@@ -584,8 +591,16 @@ int main(int argc, char* argv[]) {
     local.lid = attr.lid;
     local.qpn = qp->qp_num;
     local.psn = (lrand48() & 0xffffffff);
-    rc = ibv_query_gid(context->ctx, context->portNum, context->deviceIdx,
+    rc = ibv_query_gid(context->ctx, context->portNum, 3,
                        (ibv_gid*)&local.gid);
+    if (rc == -1)
+        printf("Query Gid failed.\n");
+
+    printf("Local gid: ");
+    for (int i = 0; i < 8; i++) {
+        printf("%x%x:", local.gid[2*i], local.gid[2*i+1]);
+    }
+    printf("\n");
 
     temp.lid = htobe16(local.lid);
     temp.qpn = htobe32(local.qpn);
@@ -695,14 +710,14 @@ int main(int argc, char* argv[]) {
                     i + 1);
         }
 
-        //RDMAWriteBatch(
-        //    qp, buffers, length, lKeys, 
-        //    remote.addr, remote.rkey, -1
-        //);
-        RDMAWrite(
-            qp, (uintptr_t) buffers[0], length, lKeys[0],
-            remote.addr[0], remote.rkey[0], 114514
+        RDMAWriteBatch(
+            qp, buffers, length, lKeys, 
+            remote.addr, remote.rkey, 114514
         );
+        //RDMAWrite(
+        //    qp, (uintptr_t) buffers[0], length, lKeys[0],
+        //    remote.addr[0], remote.rkey[0], 114514
+        //);
 
         // poll cq.
         struct ibv_wc wc;
